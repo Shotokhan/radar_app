@@ -1,22 +1,22 @@
 package com.radar.app.domain.engine
 
 import com.radar.app.data.model.ActiveSignal
+import com.radar.app.data.model.BleMetadata
 import com.radar.app.data.model.DeviceClass
 import com.radar.app.data.model.DeviceInfo
 import com.radar.app.data.model.MotionSample
+import com.radar.app.data.model.NetworkMetadata
 import com.radar.app.data.model.SignalObservation
 import com.radar.app.data.model.SignalTrend
 import com.radar.app.data.model.SignalType
 import com.radar.app.data.model.TrackedDevice
-import com.radar.app.data.model.Vector2D
-import com.radar.app.data.model.BleMetadata
 import com.radar.app.data.model.WifiApMetadata
-import com.radar.app.data.model.NetworkMetadata
 import com.radar.app.data.provider.SignalProvider
 import com.radar.app.domain.motion.MotionTracker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -28,22 +28,17 @@ import kotlin.math.abs
 
 @Singleton
 class ConvergenceEngine @Inject constructor(
-    private val motionTracker: MotionTracker
+    private val motionTracker: MotionTracker,
+    // Allows tests to inject a TestScope; production uses Default dispatcher
+    private val externalScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-
     private val _devices = MutableStateFlow<List<TrackedDevice>>(emptyList())
     val devices: StateFlow<List<TrackedDevice>> = _devices
 
-    // Internal belief state per stableId
     private val beliefs = ConcurrentHashMap<String, DeviceBelief>()
-
-    // Maps observed sourceId (MAC/BSSID) → stableId (our internal UUID)
     private val macToStableId = ConcurrentHashMap<String, String>()
-
     private val providers = ConcurrentHashMap<SignalType, SignalProvider>()
     private var activeProtocols = SignalType.values().toMutableSet()
-
     private var lastMotionSample: MotionSample = MotionSample.STATIONARY
     private val recentRssiByDevice = ConcurrentHashMap<String, ArrayDeque<Int>>()
 
@@ -51,7 +46,7 @@ class ConvergenceEngine @Inject constructor(
 
     fun addProvider(provider: SignalProvider) {
         providers[provider.type] = provider
-        scope.launch {
+        externalScope.launch {
             provider.observations.collect { obs ->
                 if (obs.sourceType in activeProtocols) {
                     processObservation(obs)
@@ -60,16 +55,14 @@ class ConvergenceEngine @Inject constructor(
         }
     }
 
-    fun removeProvider(type: SignalType) {
-        providers.remove(type)
-    }
+    fun removeProvider(type: SignalType) { providers.remove(type) }
 
     fun setActiveProtocols(types: Set<SignalType>) {
         activeProtocols = types.toMutableSet()
     }
 
     fun start() {
-        scope.launch {
+        externalScope.launch {
             motionTracker.samples.collect { sample ->
                 lastMotionSample = sample
             }
@@ -77,10 +70,9 @@ class ConvergenceEngine @Inject constructor(
         providers.values.forEach { it.start() }
         motionTracker.start()
 
-        // Periodic cleanup of stale devices
-        scope.launch {
+        externalScope.launch {
             while (true) {
-                kotlinx.coroutines.delay(5_000)
+                delay(5_000)
                 pruneStaleDevices()
                 publishDevices()
             }
@@ -92,9 +84,7 @@ class ConvergenceEngine @Inject constructor(
         motionTracker.stop()
     }
 
-    fun getDevice(stableId: String): TrackedDevice? {
-        return beliefs[stableId]?.toTrackedDevice()
-    }
+    fun getDevice(stableId: String): TrackedDevice? = beliefs[stableId]?.toTrackedDevice()
 
     // ─── Core processing ─────────────────────────────────────────────────────
 
@@ -108,8 +98,9 @@ class ConvergenceEngine @Inject constructor(
         val trend = computeTrend(stableId)
         val newProximity = updateProximityBelief(belief, obs, trend)
         val newBearing = updateBearingBelief(belief, obs, trend)
+        val mergedInfo = mergeDeviceInfo(belief.info, obs)
 
-        val updatedBelief = belief.copy(
+        beliefs[stableId] = belief.copy(
             activeMac = obs.sourceId,
             lastSeenMs = obs.timestampMs,
             lastRssi = obs.rssi,
@@ -117,42 +108,25 @@ class ConvergenceEngine @Inject constructor(
             bearingDeg = newBearing,
             bearingConfidence = if (newBearing != null) lastMotionSample.headingConfidence else 0f,
             overallConfidence = computeOverallConfidence(obs, trend),
-            observations = (belief.observations + obs).takeLast(20)
-        ).also { updated ->
-            // Merge DeviceInfo from new observation
-            val mergedInfo = mergeDeviceInfo(belief.info, obs)
-            beliefs[stableId] = updated.copy(info = mergedInfo)
-        }
+            observations = (belief.observations + obs).takeLast(20),
+            info = mergedInfo
+        )
 
         publishDevices()
     }
 
-    /**
-     * Resolves a sourceId (MAC/BSSID) to a stable internal ID.
-     * Implements spatial-temporal MAC rotation detection.
-     */
     private fun resolveStableId(obs: SignalObservation): String {
-        // Already known MAC
         macToStableId[obs.sourceId]?.let { return it }
 
-        // Try to match to a recently-lost device (MAC rotation detection)
         val rotationCandidate = beliefs.values
             .filter { belief ->
                 val timeSinceLoss = obs.timestampMs - belief.lastSeenMs
-                timeSinceLoss in 0..60_000 // within 60 seconds
+                timeSinceLoss in 0..60_000 && belief.activeMac != obs.sourceId
             }
-            .filter { belief ->
-                // Only match if the old MAC is no longer actively seen
-                belief.activeMac != obs.sourceId
-            }
-            .maxByOrNull { belief ->
-                computeRotationScore(belief, obs)
-            }
+            .maxByOrNull { computeRotationScore(it, obs) }
 
         if (rotationCandidate != null &&
             computeRotationScore(rotationCandidate, obs) > ROTATION_SCORE_THRESHOLD) {
-
-            // This new MAC is likely the same device
             macToStableId[obs.sourceId] = rotationCandidate.stableId
             beliefs[rotationCandidate.stableId] = rotationCandidate.copy(
                 activeMac = obs.sourceId,
@@ -162,50 +136,29 @@ class ConvergenceEngine @Inject constructor(
             return rotationCandidate.stableId
         }
 
-        // New device
-        val newStableId = UUID.randomUUID().toString()
-        macToStableId[obs.sourceId] = newStableId
-        return newStableId
+        val newId = UUID.randomUUID().toString()
+        macToStableId[obs.sourceId] = newId
+        return newId
     }
 
-    /**
-     * Scores how likely obs is a MAC rotation of an existing belief.
-     * Combines spatial proximity + temporal proximity + RSSI similarity.
-     */
     private fun computeRotationScore(belief: DeviceBelief, obs: SignalObservation): Float {
         val timeSinceLoss = (obs.timestampMs - belief.lastSeenMs).coerceAtLeast(0)
         val temporalScore = 1f - (timeSinceLoss / 60_000f).coerceIn(0f, 1f)
-
-        val rssiSimilarity = if (belief.lastRssi != null && obs.rssi != null) {
-            val delta = abs(belief.lastRssi - obs.rssi)
-            1f - (delta / 20f).coerceIn(0f, 1f)
-        } else 0.5f
-
-        // Spatial score: high proximity score implies device is "nearby" — likely same spot
-        val spatialScore = belief.proximityScore
-
-        return (temporalScore * 0.4f) + (rssiSimilarity * 0.4f) + (spatialScore * 0.2f)
+        val rssiSimilarity = if (belief.lastRssi != null && obs.rssi != null)
+            1f - (abs(belief.lastRssi - obs.rssi) / 20f).coerceIn(0f, 1f)
+        else 0.5f
+        return (temporalScore * 0.4f) + (rssiSimilarity * 0.4f) + (belief.proximityScore * 0.2f)
     }
 
-    /**
-     * Updates proximity score using motion-correlated RSSI gradient.
-     * Key invariant: if user walks toward device, proximity increases on average.
-     */
     private fun updateProximityBelief(
-        belief: DeviceBelief,
-        obs: SignalObservation,
-        trend: SignalTrend
+        belief: DeviceBelief, obs: SignalObservation, trend: SignalTrend
     ): Float {
         val current = belief.proximityScore
         val motion = lastMotionSample
-
-        // Only update proximity if signal delta exceeds the motion gate
         val rssiDelta = if (belief.lastRssi != null && obs.rssi != null)
-            abs(belief.lastRssi - obs.rssi).toFloat()
-        else 0f
+            abs(belief.lastRssi - obs.rssi).toFloat() else 0f
 
         if (rssiDelta < motion.motionGate && motion.isStationary) {
-            // Signal noise without motion — dampen toward current value, don't move
             return current * 0.99f + obs.normalizedSignal * 0.01f
         }
 
@@ -217,39 +170,22 @@ class ConvergenceEngine @Inject constructor(
             else -> 0f
         }
 
-        // Inertial smoothing: max change per tick is capped to prevent teleporting
         val rawNew = current + convergenceDelta
-        val maxChange = MAX_PROXIMITY_CHANGE_PER_TICK
-        val clamped = rawNew.coerceIn(current - maxChange, current + maxChange)
-
+        val clamped = rawNew.coerceIn(current - MAX_PROXIMITY_CHANGE_PER_TICK, current + MAX_PROXIMITY_CHANGE_PER_TICK)
         return clamped.coerceIn(0f, 1f)
     }
 
-    /**
-     * Estimates bearing from motion heading + signal trend correlation.
-     */
     private fun updateBearingBelief(
-        belief: DeviceBelief,
-        obs: SignalObservation,
-        trend: SignalTrend
+        belief: DeviceBelief, obs: SignalObservation, trend: SignalTrend
     ): Float? {
         val motion = lastMotionSample
         if (motion.isStationary || motion.headingConfidence < 0.3f) return belief.bearingDeg
-
         return when (trend) {
             SignalTrend.APPROACHING -> {
-                // Device is roughly in the direction we're walking
-                val existing = belief.bearingDeg
-                if (existing == null) {
-                    motion.headingDeg
-                } else {
-                    // Weighted average: pull bearing toward current heading
-                    val weight = motion.headingConfidence * 0.3f
-                    angleLerp(existing, motion.headingDeg, weight)
-                }
+                val existing = belief.bearingDeg ?: return motion.headingDeg
+                angleLerp(existing, motion.headingDeg, motion.headingConfidence * 0.3f)
             }
             SignalTrend.RECEDING -> {
-                // Device is roughly behind us
                 val behind = (motion.headingDeg + 180f) % 360f
                 val existing = belief.bearingDeg ?: behind
                 angleLerp(existing, behind, 0.2f)
@@ -261,15 +197,10 @@ class ConvergenceEngine @Inject constructor(
     private fun computeTrend(stableId: String): SignalTrend {
         val history = recentRssiByDevice[stableId] ?: return SignalTrend.UNKNOWN
         if (history.size < 3) return SignalTrend.UNKNOWN
-
         val recent = history.takeLast(3)
         val older = history.dropLast(3).takeLast(3)
         if (older.isEmpty()) return SignalTrend.UNKNOWN
-
-        val recentAvg = recent.average()
-        val olderAvg = older.average()
-        val delta = recentAvg - olderAvg
-
+        val delta = recent.average() - older.average()
         return when {
             delta > 3.0 -> SignalTrend.APPROACHING
             delta < -3.0 -> SignalTrend.RECEDING
@@ -284,10 +215,8 @@ class ConvergenceEngine @Inject constructor(
         history.addLast(rssi)
     }
 
-    private fun computeOverallConfidence(obs: SignalObservation, trend: SignalTrend): Float {
-        val trendBoost = if (trend != SignalTrend.UNKNOWN) 0.1f else 0f
-        return (obs.confidence + trendBoost).coerceIn(0f, 1f)
-    }
+    private fun computeOverallConfidence(obs: SignalObservation, trend: SignalTrend): Float =
+        (obs.confidence + if (trend != SignalTrend.UNKNOWN) 0.1f else 0f).coerceIn(0f, 1f)
 
     private fun mergeDeviceInfo(existing: DeviceInfo, obs: SignalObservation): DeviceInfo {
         val meta = obs.metadata
@@ -298,16 +227,12 @@ class ConvergenceEngine @Inject constructor(
         }
         val ip = (meta as? NetworkMetadata)?.ipAddress ?: existing.ipAddress
         val mdns = (meta as? NetworkMetadata)?.mdnsServiceTypes ?: existing.mdnsServices
-
-        val protocols = existing.availableProtocols + obs.sourceType
-        val inferredClass = inferDeviceClass(obs, existing)
-
         return existing.copy(
             displayName = name ?: existing.displayName,
             ipAddress = ip,
             mdnsServices = mdns,
-            availableProtocols = protocols,
-            inferredClass = inferredClass
+            availableProtocols = existing.availableProtocols + obs.sourceType,
+            inferredClass = inferDeviceClass(obs, existing)
         )
     }
 
@@ -328,10 +253,7 @@ class ConvergenceEngine @Inject constructor(
 
     private fun pruneStaleDevices() {
         val now = System.currentTimeMillis()
-        val staleThreshold = 30_000L // 30 seconds without observation
-        beliefs.entries.removeIf { (_, belief) ->
-            now - belief.lastSeenMs > staleThreshold
-        }
+        beliefs.entries.removeIf { (_, belief) -> now - belief.lastSeenMs > 30_000L }
     }
 
     private fun publishDevices() {
@@ -340,9 +262,6 @@ class ConvergenceEngine @Inject constructor(
             .sortedByDescending { it.proximityScore }
     }
 
-    // ─── Helpers ─────────────────────────────────────────────────────────────
-
-    /** Lerp between two angles correctly handling 0/360 wrap-around */
     private fun angleLerp(from: Float, to: Float, t: Float): Float {
         var diff = to - from
         while (diff > 180f) diff -= 360f
@@ -357,7 +276,7 @@ class ConvergenceEngine @Inject constructor(
     }
 }
 
-// ─── Internal belief state (not exposed to UI) ────────────────────────────────
+// ─── Internal belief state ────────────────────────────────────────────────────
 
 private data class DeviceBelief(
     val stableId: String,
@@ -375,17 +294,9 @@ private data class DeviceBelief(
     val observations: List<SignalObservation> = emptyList()
 ) {
     fun toTrackedDevice(): TrackedDevice {
-        val signals = observations
-            .groupBy { it.sourceType }
-            .map { (type, obs) ->
-                val latest = obs.maxByOrNull { it.timestampMs }!!
-                ActiveSignal(
-                    type = type,
-                    currentRssi = latest.rssi,
-                    trend = SignalTrend.UNKNOWN // trend computed in engine
-                )
-            }
-
+        val signals = observations.groupBy { it.sourceType }.map { (type, obs) ->
+            ActiveSignal(type = type, currentRssi = obs.maxByOrNull { it.timestampMs }!!.rssi, trend = SignalTrend.UNKNOWN)
+        }
         return TrackedDevice(
             stableId = stableId,
             proximityScore = proximityScore,
@@ -393,10 +304,7 @@ private data class DeviceBelief(
             bearingConfidence = bearingConfidence,
             overallConfidence = overallConfidence,
             lastUpdatedMs = lastSeenMs,
-            info = info.copy(
-                knownMacs = macHistory.ifEmpty { listOf(activeMac) },
-                macRotationCount = macRotationCount
-            ),
+            info = info.copy(knownMacs = macHistory.ifEmpty { listOf(activeMac) }, macRotationCount = macRotationCount),
             signals = signals
         )
     }
