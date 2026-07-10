@@ -5,7 +5,7 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:        # allows manual trigger from GitHub UI
+  workflow_dispatch:
 
 jobs:
   build:
@@ -38,11 +38,18 @@ jobs:
           curl -L -o gradle/wrapper/gradle-wrapper.jar \
             https://github.com/gradle/gradle/raw/v8.9.0/gradle/wrapper/gradle-wrapper.jar
 
-      - name: Run unit tests
-        run: ./gradlew test --no-daemon
+      - name: Build debug APK (includes unit tests)
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
 
-      - name: Build debug APK
-        run: ./gradlew assembleDebug --no-daemon
+      - name: Run unit tests
+        run: ./gradlew testDebugUnitTest --no-daemon
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: app/build/reports/tests/
 
       - name: Upload APK as artifact
         uses: actions/upload-artifact@v4
@@ -51,7 +58,7 @@ jobs:
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
 
-      # ── Auto-release on push to main ─────────────────────────────────────
+      # ── Auto-release on push to main ──────────────────────────────────────
       - name: Get short SHA
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
         id: sha
