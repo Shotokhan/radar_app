@@ -4,10 +4,8 @@ import com.radar.app.data.model.BleMetadata
 import com.radar.app.data.model.SignalObservation
 import com.radar.app.data.model.SignalType
 import com.radar.app.data.provider.FakeSignalProvider
-import com.radar.app.di.ApplicationScope
 import com.radar.app.domain.engine.ConvergenceEngine
 import com.radar.app.domain.motion.FakeMotionTracker
-import dagger.hilt.android.testing.HiltAndroidTest
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
